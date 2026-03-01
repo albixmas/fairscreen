@@ -1,9 +1,9 @@
-import { Queue } from "bullmq";
+import { Queue, type ConnectionOptions } from "bullmq";
 import IORedis from "ioredis";
 
 const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
 
-export const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
+export const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null }) as unknown as ConnectionOptions;
 
 export const QUEUE_NAMES = {
   PARSE_CV: "parse_cv_file",
