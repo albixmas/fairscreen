@@ -1,0 +1,24 @@
+{
+  "name": "@fairscreen/worker",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@fairscreen/db": "*",
+    "@fairscreen/shared": "*",
+    "@fairscreen/scoring": "*",
+    "@fairscreen/extraction": "*",
+    "bullmq": "^5.7.0",
+    "ioredis": "^5.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "tsx": "^4.7.0"
+  }
+}

@@ -1,0 +1,272 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ===== Enums =====
+
+enum FileType {
+  PDF
+  DOCX
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum PreScreenStatus {
+  PASS
+  FAIL
+}
+
+enum ZoneEnum {
+  STRONG_YES
+  YES
+  MAYBE
+  NO
+  PRESCREEN_FAIL
+}
+
+enum AxisEnum {
+  EDU
+  CAREER
+}
+
+enum CountryEnum {
+  UK
+}
+
+enum RolePresetEnum {
+  UK_BA
+}
+
+enum UserRoleEnum {
+  ADMIN
+  RECRUITER
+}
+
+enum DegreeClassEnum {
+  FIRST
+  HIGH_21
+  SECOND_21
+  SECOND_22
+  OTHER
+}
+
+enum UniversityTierEnum {
+  PRIORITY_1
+  TIER_1
+  TIER_2
+  OTHER
+}
+
+enum EmployerTierEnum {
+  ELITE
+  SELECTIVE
+  OTHER
+}
+
+enum DivisionCategoryEnum {
+  STRATEGY
+  DEALS
+  IB
+  AUDIT
+  COMPLIANCE
+  OPS
+  TECH_PRODUCT
+  TECH_DATA
+  CORPORATE_STRATEGY
+  OTHER
+}
+
+// ===== Models =====
+
+model User {
+  id            String          @id @default(cuid())
+  email         String          @unique
+  passwordHash  String
+  role          UserRoleEnum    @default(RECRUITER)
+  createdAt     DateTime        @default(now())
+  policyVersions PolicyVersion[]
+}
+
+model CVFile {
+  id            String      @id @default(cuid())
+  filename      String
+  fileType      FileType
+  storagePath   String
+  textContent   String?     @db.Text
+  pageMapJson   Json?
+  parseStatus   JobStatus   @default(QUEUED)
+  parseError    String?
+  createdAt     DateTime    @default(now())
+  candidate     Candidate?
+}
+
+model Candidate {
+  id              String              @id @default(cuid())
+  fullName        String
+  email           String?
+  phone           String?
+  location        String?
+  createdAt       DateTime            @default(now())
+  cvFileId        String              @unique
+  cvFile          CVFile              @relation(fields: [cvFileId], references: [id])
+  extractions     Extraction[]
+  preScreenResult PreScreenResult?
+  subcategoryScores SubcategoryScore[]
+  axisScore       AxisScore?
+  zoneAssignments ZoneAssignment[]
+}
+
+model Extraction {
+  id              String      @id @default(cuid())
+  candidateId     String
+  candidate       Candidate   @relation(fields: [candidateId], references: [id])
+  provider        String
+  schemaVersion   String
+  status          JobStatus   @default(QUEUED)
+  extractedJson   Json?
+  evidenceJson    Json?
+  error           String?
+  createdAt       DateTime    @default(now())
+}
+
+model PreScreenResult {
+  id              String          @id @default(cuid())
+  candidateId     String          @unique
+  candidate       Candidate       @relation(fields: [candidateId], references: [id])
+  status          PreScreenStatus
+  reasons         Json            @default("[]")
+  yoeMonths       Int?
+  degreeClass     DegreeClassEnum?
+  createdAt       DateTime        @default(now())
+}
+
+model SubcategoryScore {
+  id              String      @id @default(cuid())
+  candidateId     String
+  candidate       Candidate   @relation(fields: [candidateId], references: [id])
+  axis            AxisEnum
+  code            String      // E1..E5 or C1..C5
+  ladderScore     Int         // 1-5
+  normalizedU     Float       // 0-1
+  weight          Float
+  zScore          Float?
+  percentile      Float?
+  rationale       String      @db.Text
+  evidenceRefs    Json        @default("[]")
+  createdAt       DateTime    @default(now())
+
+  @@index([candidateId])
+  @@index([code])
+}
+
+model AxisScore {
+  id              String      @id @default(cuid())
+  candidateId     String      @unique
+  candidate       Candidate   @relation(fields: [candidateId], references: [id])
+  eduScore        Float       // 0-25
+  careerScore     Float       // 0-25
+  policyVersionId String?
+  policyVersion   PolicyVersion? @relation(fields: [policyVersionId], references: [id])
+  createdAt       DateTime    @default(now())
+}
+
+model ZoneAssignment {
+  id              String          @id @default(cuid())
+  candidateId     String
+  candidate       Candidate       @relation(fields: [candidateId], references: [id])
+  zone            ZoneEnum
+  hiringZonePass  Boolean         @default(false)
+  policyVersionId String
+  policyVersion   PolicyVersion   @relation(fields: [policyVersionId], references: [id])
+  createdAt       DateTime        @default(now())
+
+  @@index([candidateId])
+  @@index([policyVersionId])
+}
+
+model PolicyVersion {
+  id                    String              @id @default(cuid())
+  name                  String
+  country               CountryEnum         @default(UK)
+  rolePreset            RolePresetEnum      @default(UK_BA)
+  preScreenRules        Json
+  axisCutoffs           Json
+  subcategoryThresholds Json                @default("{}")
+  weights               Json
+  spikePolicy           Json                @default("{}")
+  createdByUserId       String
+  createdBy             User                @relation(fields: [createdByUserId], references: [id])
+  createdAt             DateTime            @default(now())
+  notes                 String?             @db.Text
+  axisScores            AxisScore[]
+  zoneAssignments       ZoneAssignment[]
+  cohortStats           CohortStats[]
+}
+
+model UniversityTaxonomy {
+  id                String              @id @default(cuid())
+  country           CountryEnum         @default(UK)
+  institutionName   String
+  tier              UniversityTierEnum
+  disciplineNotes   String?
+  versionTag        String              @default("v1")
+  createdAt         DateTime            @default(now())
+
+  @@unique([country, institutionName, versionTag])
+}
+
+model DegreeTaxonomy {
+  id                String          @id @default(cuid())
+  country           CountryEnum     @default(UK)
+  degreeType        String          // BA/BSC/BENG etc
+  notes             String?
+  versionTag        String          @default("v1")
+  createdAt         DateTime        @default(now())
+
+  @@unique([country, degreeType, versionTag])
+}
+
+model EmployerFamilyTaxonomy {
+  id                String              @id @default(cuid())
+  country           CountryEnum         @default(UK)
+  employerFamily    String
+  tier              EmployerTierEnum
+  versionTag        String              @default("v1")
+  createdAt         DateTime            @default(now())
+
+  @@unique([country, employerFamily, versionTag])
+}
+
+model DivisionRoleTaxonomy {
+  id                        String                  @id @default(cuid())
+  country                   CountryEnum             @default(UK)
+  employerFamily            String
+  category                  DivisionCategoryEnum
+  keywords                  Json                    @default("[]")
+  selectivityMultiplier     Float                   @default(1.0)
+  notes                     String?
+  versionTag                String                  @default("v1")
+  createdAt                 DateTime                @default(now())
+
+  @@unique([country, employerFamily, category, versionTag])
+}
+
+model CohortStats {
+  id                String              @id @default(cuid())
+  country           CountryEnum         @default(UK)
+  rolePreset        RolePresetEnum      @default(UK_BA)
+  policyVersionId   String?
+  policyVersion     PolicyVersion?      @relation(fields: [policyVersionId], references: [id])
+  computedAt        DateTime            @default(now())
+  statsJson         Json
+}

@@ -1,0 +1,536 @@
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/db";
+import {
+  scoreCandidate,
+  computeCohortStats,
+  determineZone,
+  InMemoryUniversityLookup,
+  InMemoryEmployerLookup,
+  InMemoryDivisionLookup,
+  DEFAULT_UK_UNIVERSITIES,
+  DEFAULT_UK_EMPLOYERS,
+  DEFAULT_UK_DIVISION_RULES,
+} from "@fairscreen/scoring";
+import { DEFAULT_AXIS_CUTOFFS } from "@fairscreen/shared";
+import type { ExtractionResult } from "@fairscreen/shared";
+
+const uniLookup = new InMemoryUniversityLookup(DEFAULT_UK_UNIVERSITIES);
+const empLookup = new InMemoryEmployerLookup(DEFAULT_UK_EMPLOYERS);
+const divLookup = new InMemoryDivisionLookup(DEFAULT_UK_DIVISION_RULES);
+
+function pick<T>(arr: readonly T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function weightedPick<T>(arr: readonly T[], weights: number[]): T {
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < arr.length; i++) {
+    r -= weights[i];
+    if (r <= 0) return arr[i];
+  }
+  return arr[arr.length - 1];
+}
+
+function gaussRandom(mean: number, std: number): number {
+  const u = 1 - Math.random();
+  const v = Math.random();
+  const z = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+  return z * std + mean;
+}
+
+const INSTITUTIONS = [
+  "University of Oxford", "University of Cambridge", "LSE",
+  "Imperial College London", "UCL",
+  "University of Warwick", "Durham University", "University of Edinburgh",
+  "University of Bath", "University of Bristol", "University of Manchester",
+  "King's College London", "University of Glasgow", "University of Leeds",
+  "University of Sheffield", "University of York", "University of Southampton",
+  "Lancaster University", "Cardiff University", "Queen Mary University of London",
+  "Northumbria University", "De Montfort University", "University of Sunderland",
+  "London Metropolitan University", "University of Bolton",
+];
+
+const INST_WEIGHTS = [
+  8, 8, 6, 6, 6,  // Priority 1
+  5, 4, 4, 4, 4, 4, 3, 3, 3,  // Tier 1
+  3, 3, 3, 3, 2, 2,  // Tier 2
+  2, 2, 1, 1, 1,  // Other
+];
+
+const EMPLOYERS = [
+  "McKinsey & Company", "Goldman Sachs", "BCG", "Bain & Company",
+  "PwC", "Deloitte", "EY", "KPMG", "Accenture",
+  "Morgan Stanley", "JPMorgan", "Rothschild",
+  "Google", "Amazon", "Barclays", "HSBC",
+  "Local Consulting Firm", "Small Tech Startup", "Retail Company",
+  "None",
+];
+
+const EMP_WEIGHTS = [
+  3, 3, 3, 3,
+  8, 8, 7, 7, 5,
+  3, 3, 2,
+  4, 4, 4, 4,
+  6, 5, 4,
+  8,
+];
+
+const DIVISIONS = [
+  ["strategy", "consulting"], ["audit", "assurance"], ["deals", "m&a", "transactions"],
+  ["investment banking"], ["technology", "product"], ["operations"],
+  ["compliance"], ["corporate finance"],
+];
+
+const DIV_WEIGHTS = [4, 5, 3, 2, 3, 3, 2, 2];
+
+const FIRST_NAMES = [
+  "Oliver", "Amelia", "George", "Isla", "Harry", "Olivia", "Jack", "Emily",
+  "Charlie", "Sophia", "Leo", "Ava", "Thomas", "Grace", "Oscar", "Mia",
+  "James", "Lily", "William", "Ella", "Henry", "Chloe", "Alexander", "Charlotte",
+  "Daniel", "Hannah", "Ethan", "Lucy", "Benjamin", "Freya", "Noah", "Evie",
+  "Rahul", "Priya", "Mohammed", "Fatima", "Wei", "Mei", "Kofi", "Ama",
+  "Yuki", "Sakura", "Pierre", "Marie", "Carlos", "Sofia", "Ivan", "Natalia",
+];
+
+const LAST_NAMES = [
+  "Smith", "Jones", "Taylor", "Brown", "Wilson", "Davies", "Evans", "Thomas",
+  "Johnson", "Roberts", "Walker", "Wright", "Thompson", "White", "Hughes",
+  "Edwards", "Green", "Hall", "Lewis", "Harris", "Clarke", "Patel", "Jackson",
+  "Wood", "Turner", "Martin", "Cooper", "Hill", "Ward", "Morris",
+  "Shah", "Khan", "Singh", "Kumar", "Chen", "Wang", "Li", "Zhang",
+  "Nakamura", "Tanaka", "Müller", "Schmidt", "García", "Fernández",
+];
+
+export async function POST() {
+  try {
+    // Seed taxonomies first
+    await seedTaxonomies();
+
+    // Create admin user
+    let user = await prisma.user.findFirst({ where: { role: "ADMIN" } });
+    if (!user) {
+      const bcrypt = await import("bcryptjs");
+      user = await prisma.user.create({
+        data: {
+          email: "admin@fairscreen.io",
+          passwordHash: await bcrypt.hash("admin", 10),
+          role: "ADMIN",
+        },
+      });
+    }
+
+    // Create default policy
+    const policy = await prisma.policyVersion.upsert({
+      where: { id: "default-policy" },
+      create: {
+        id: "default-policy",
+        name: "Default UK BA Policy",
+        preScreenRules: { degreeMin: "SECOND_21", maxYOEMonths: 24, requiresDegree: true, qualifyingInternshipMinWeeks: 6 },
+        axisCutoffs: { strongYes: 18, yes: 15, maybe: 10 },
+        subcategoryThresholds: {},
+        weights: {
+          edu: { E1: 0.30, E2: 0.30, E3: 0.10, E4: 0.20, E5: 0.10 },
+          career: { C1: 0.40, C2: 0.25, C3: 0.20, C4: 0.10, C5: 0.05 },
+        },
+        spikePolicy: { enabled: true, thresholdPct: 0.99, promoteMaybeToYes: true, noAutoPromoteNo: true },
+        createdByUserId: user.id,
+        notes: "Default policy generated by demo seed",
+      },
+      update: {},
+    });
+
+    // Generate 1500 candidates
+    const BATCH_SIZE = 100;
+    const TOTAL = 1500;
+    const allScoringResults: Array<{
+      candidateId: string;
+      subcategoryScores: any[];
+      eduScore: number;
+      careerScore: number;
+    }> = [];
+
+    for (let batch = 0; batch < TOTAL / BATCH_SIZE; batch++) {
+      const candidates = [];
+
+      for (let i = 0; i < BATCH_SIZE; i++) {
+        const firstName = pick(FIRST_NAMES);
+        const lastName = pick(LAST_NAMES);
+        const fullName = `${firstName} ${lastName}`;
+        const institution = weightedPick(INSTITUTIONS, INST_WEIGHTS);
+        const employer = weightedPick(EMPLOYERS, EMP_WEIGHTS);
+        const divKeywords = weightedPick(DIVISIONS, DIV_WEIGHTS);
+        const grade = weightedPick(
+          ["FIRST", "HIGH_21", "SECOND_21", "SECOND_22", "OTHER"] as const,
+          [15, 30, 35, 15, 5]
+        );
+
+        const hasMasters = Math.random() < 0.25;
+        const hasLeadership = Math.random() < 0.45;
+        const hasExcellence = Math.random() < 0.35;
+        const durationWeeks = pick([4, 6, 8, 10, 12]);
+
+        const awards: string[] = [];
+        if (Math.random() < 0.08) awards.push("Rhodes Scholar");
+        if (Math.random() < 0.15) awards.push("Dean's List");
+        if (Math.random() < 0.10) awards.push("Academic Prize");
+        if (Math.random() < 0.05) awards.push("Highest mark in cohort");
+        if (Math.random() < 0.12) awards.push("Scholarship recipient");
+
+        const societies: string[] = [];
+        if (Math.random() < 0.15) societies.push("President of Economics Society");
+        if (Math.random() < 0.10) societies.push("Case Competition Winner");
+        if (Math.random() < 0.12) societies.push("Debate Team Captain");
+        if (Math.random() < 0.20) societies.push("Finance Society Committee");
+        if (Math.random() < 0.25) societies.push("Sports Club Member");
+        if (Math.random() < 0.08) societies.push("International Case Competition Finalist");
+
+        const extraction: ExtractionResult = {
+          candidate: {
+            fullName,
+            email: `${firstName.toLowerCase()}.${lastName.toLowerCase()}@email.com`,
+            location: pick(["London", "Manchester", "Edinburgh", "Bristol", "Oxford", "Cambridge", "Birmingham"]),
+          },
+          education: [
+            {
+              institution,
+              country: "UK",
+              degreeType: pick(["BA", "BSC", "BENG"]),
+              field: pick(["Economics", "PPE", "Mathematics", "Computer Science", "Engineering", "History", "Finance", "Physics", "Law"]),
+              startDate: "2019-09",
+              endDate: "2022-06",
+              gradeText: grade === "FIRST" ? "First Class Honours" : grade === "HIGH_21" ? "Upper Second Class (2:1)" : "2:2",
+              gradeNormalized: grade,
+              marks: grade === "FIRST" ? Math.floor(gaussRandom(74, 3)) : null,
+              awards,
+              societies,
+              activities: Math.random() < 0.3 ? ["Organized annual conference"] : [],
+            },
+            ...(hasMasters ? [{
+              institution: weightedPick(INSTITUTIONS.slice(0, 10), INST_WEIGHTS.slice(0, 10)),
+              country: "UK" as string,
+              degreeType: pick(["MSC", "MPHIL"] as const),
+              field: pick(["Finance", "Management", "Data Science", "Economics"]),
+              startDate: "2022-09",
+              endDate: "2023-09",
+              gradeText: Math.random() < 0.4 ? "Distinction" : Math.random() < 0.7 ? "Merit" : "Pass",
+              gradeNormalized: undefined,
+              marks: null,
+              awards: [] as string[],
+              societies: [] as string[],
+              activities: [] as string[],
+            }] : []),
+          ],
+          work: employer !== "None" ? [{
+            employer,
+            roleTitle: pick(["Summer Analyst", "Intern", "Associate", "Consultant", "Strategy Intern", "Audit Intern", "Analyst"]),
+            divisionKeywordsFound: divKeywords,
+            startDate: "2022-06",
+            endDate: "2022-09",
+            durationWeeks,
+            bullets: [
+              { text: "Supported team on key deliverables", metrics: [] },
+              ...(Math.random() < 0.4 ? [{ text: "Led workstream worth significant value", metrics: [{ value: String(Math.floor(Math.random() * 100) * 10), unit: "M" }] }] : []),
+            ],
+            internshipFlag: true,
+            qualifyingInternship: durationWeeks >= 6,
+          }] : [],
+          leadershipProjects: hasLeadership ? [{
+            title: pick([
+              "Founded university charity",
+              "Led consulting project for local NGO",
+              "Started student startup",
+              "Organized 200-person conference",
+              "Directed university theatre production",
+            ]),
+            org: pick(["University Society", "Independent", "Student Union"]),
+            scope: {
+              teamSize: Math.floor(gaussRandom(10, 5)),
+              fundsRaised: Math.random() < 0.3 ? `£${Math.floor(Math.random() * 50) * 1000}` : undefined,
+            },
+            achievements: [pick([
+              "Successfully delivered project outcomes",
+              "Grew membership by 200%",
+              "Raised £25,000 for charity",
+              "Won best society award",
+            ])],
+            metrics: [],
+          }] : [],
+          nonAcademicExcellence: hasExcellence ? [{
+            domain: pick(["SPORT", "ARTS", "COMPETITION", "VOLUNTEERING"] as const),
+            level: weightedPick(
+              ["LOCAL", "UNIVERSITY", "REGIONAL", "NATIONAL", "INTERNATIONAL"] as const,
+              [20, 30, 25, 15, 10]
+            ),
+            description: pick([
+              "County-level athlete", "University orchestra first violin",
+              "Regional chess champion", "National debating finalist",
+              "International hackathon winner", "Volunteered 500+ hours",
+            ]),
+          }] : [],
+        };
+
+        // Score the candidate
+        const scoringResult = scoreCandidate({
+          extraction,
+          uniLookup: uniLookup,
+          employerLookup: empLookup,
+          divisionLookup: divLookup,
+        });
+
+        candidates.push({
+          fullName,
+          extraction,
+          scoringResult,
+        });
+      }
+
+      // Bulk insert this batch
+      for (const c of candidates) {
+        const cvFile = await prisma.cVFile.create({
+          data: {
+            filename: `${c.fullName.replace(/ /g, "_")}.pdf`,
+            fileType: "PDF",
+            storagePath: `/demo/${c.fullName.replace(/ /g, "_")}.pdf`,
+            textContent: `Demo CV for ${c.fullName}`,
+            parseStatus: "SUCCEEDED",
+          },
+        });
+
+        const candidate = await prisma.candidate.create({
+          data: {
+            fullName: c.fullName,
+            email: c.extraction.candidate.email,
+            phone: c.extraction.candidate.phone,
+            location: c.extraction.candidate.location,
+            cvFileId: cvFile.id,
+          },
+        });
+
+        await prisma.extraction.create({
+          data: {
+            candidateId: candidate.id,
+            provider: "demo",
+            schemaVersion: "1.0",
+            status: "SUCCEEDED",
+            extractedJson: c.extraction as any,
+            evidenceJson: [],
+          },
+        });
+
+        await prisma.preScreenResult.create({
+          data: {
+            candidateId: candidate.id,
+            status: c.scoringResult.preScreen.status,
+            reasons: c.scoringResult.preScreen.reasons,
+            yoeMonths: c.scoringResult.preScreen.yoeMonths,
+            degreeClass: c.scoringResult.preScreen.degreeClass as any,
+          },
+        });
+
+        await prisma.subcategoryScore.createMany({
+          data: c.scoringResult.subcategoryScores.map((s) => ({
+            candidateId: candidate.id,
+            axis: s.axis,
+            code: s.code,
+            ladderScore: s.ladderScore,
+            normalizedU: s.normalizedU,
+            weight: s.weight,
+            rationale: s.rationale,
+            evidenceRefs: s.evidenceRefs,
+          })),
+        });
+
+        await prisma.axisScore.create({
+          data: {
+            candidateId: candidate.id,
+            eduScore: c.scoringResult.axisScores.eduScore,
+            careerScore: c.scoringResult.axisScores.careerScore,
+          },
+        });
+
+        allScoringResults.push({
+          candidateId: candidate.id,
+          subcategoryScores: c.scoringResult.subcategoryScores,
+          eduScore: c.scoringResult.axisScores.eduScore,
+          careerScore: c.scoringResult.axisScores.careerScore,
+        });
+      }
+    }
+
+    // Compute cohort stats
+    const { normalized, distributions, axisStats } = computeCohortStats(allScoringResults);
+
+    // Update z-scores and percentiles in batches
+    for (let i = 0; i < normalized.length; i += 500) {
+      const batch = normalized.slice(i, i + 500);
+      await Promise.all(
+        batch.map((n) =>
+          prisma.subcategoryScore.updateMany({
+            where: { candidateId: n.candidateId, code: n.code },
+            data: { zScore: n.zScore, percentile: n.percentile },
+          })
+        )
+      );
+    }
+
+    // Store cohort stats
+    await prisma.cohortStats.create({
+      data: {
+        country: "UK",
+        rolePreset: "UK_BA",
+        statsJson: {
+          subcategories: Object.fromEntries(
+            distributions.map((d) => [d.code, { mean: d.mean, std: d.std, count: d.count, bins: d.bins, percentiles: d.percentiles }])
+          ),
+          axes: axisStats,
+        } as any,
+      },
+    });
+
+    // Assign zones under default policy
+    const allCandidates = await prisma.candidate.findMany({
+      include: { axisScore: true, preScreenResult: true, subcategoryScores: true },
+      where: { axisScore: { isNot: null } },
+    });
+
+    const zoneAssignments = allCandidates
+      .filter((c) => c.axisScore)
+      .map((c) => {
+        const percentiles = new Map<string, number>();
+        for (const s of c.subcategoryScores) {
+          if (s.percentile != null) percentiles.set(s.code, s.percentile);
+        }
+        const zone = determineZone(
+          c.axisScore!.eduScore,
+          c.axisScore!.careerScore,
+          DEFAULT_AXIS_CUTOFFS,
+          (c.preScreenResult?.status ?? "FAIL") as "PASS" | "FAIL",
+          { enabled: true, thresholdPct: 0.99, promoteMaybeToYes: true, noAutoPromoteNo: true },
+          percentiles
+        );
+        return {
+          candidateId: c.id,
+          zone: zone.zone,
+          hiringZonePass: zone.hiringZonePass,
+          policyVersionId: policy.id,
+        };
+      });
+
+    await prisma.zoneAssignment.createMany({ data: zoneAssignments });
+
+    const zoneCounts: Record<string, number> = {};
+    for (const za of zoneAssignments) {
+      zoneCounts[za.zone] = (zoneCounts[za.zone] || 0) + 1;
+    }
+
+    return NextResponse.json({
+      success: true,
+      candidatesCreated: TOTAL,
+      zoneCounts,
+      hiringZonePass: zoneAssignments.filter((z) => z.hiringZonePass).length,
+    });
+  } catch (error: any) {
+    console.error("Demo seed error:", error);
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+
+async function seedTaxonomies() {
+  // Universities
+  const uniEntries = [
+    { name: "University of Oxford", tier: "PRIORITY_1" },
+    { name: "University of Cambridge", tier: "PRIORITY_1" },
+    { name: "London School of Economics", tier: "PRIORITY_1" },
+    { name: "Imperial College London", tier: "PRIORITY_1" },
+    { name: "University College London", tier: "PRIORITY_1" },
+    { name: "University of Warwick", tier: "TIER_1" },
+    { name: "Durham University", tier: "TIER_1" },
+    { name: "University of Edinburgh", tier: "TIER_1" },
+    { name: "University of Bath", tier: "TIER_1" },
+    { name: "University of Bristol", tier: "TIER_1" },
+    { name: "University of Manchester", tier: "TIER_1" },
+    { name: "King's College London", tier: "TIER_1" },
+    { name: "University of Glasgow", tier: "TIER_1" },
+    { name: "University of Leeds", tier: "TIER_1" },
+    { name: "University of Birmingham", tier: "TIER_1" },
+    { name: "University of Sheffield", tier: "TIER_2" },
+    { name: "University of York", tier: "TIER_2" },
+    { name: "University of Southampton", tier: "TIER_2" },
+    { name: "Lancaster University", tier: "TIER_2" },
+    { name: "Cardiff University", tier: "TIER_2" },
+    { name: "Queen Mary University of London", tier: "TIER_2" },
+  ] as const;
+
+  for (const u of uniEntries) {
+    await prisma.universityTaxonomy.upsert({
+      where: { country_institutionName_versionTag: { country: "UK", institutionName: u.name, versionTag: "v1" } },
+      create: { country: "UK", institutionName: u.name, tier: u.tier, versionTag: "v1" },
+      update: { tier: u.tier },
+    });
+  }
+
+  // Employer families
+  const employers = [
+    { family: "McKinsey", tier: "ELITE" },
+    { family: "BCG", tier: "ELITE" },
+    { family: "Bain", tier: "ELITE" },
+    { family: "Goldman Sachs", tier: "ELITE" },
+    { family: "Morgan Stanley", tier: "ELITE" },
+    { family: "JPMorgan", tier: "ELITE" },
+    { family: "Rothschild", tier: "ELITE" },
+    { family: "PwC", tier: "SELECTIVE" },
+    { family: "Deloitte", tier: "SELECTIVE" },
+    { family: "EY", tier: "SELECTIVE" },
+    { family: "KPMG", tier: "SELECTIVE" },
+    { family: "Accenture", tier: "SELECTIVE" },
+    { family: "Google", tier: "ELITE" },
+    { family: "Amazon", tier: "SELECTIVE" },
+  ] as const;
+
+  for (const e of employers) {
+    await prisma.employerFamilyTaxonomy.upsert({
+      where: { country_employerFamily_versionTag: { country: "UK", employerFamily: e.family, versionTag: "v1" } },
+      create: { country: "UK", employerFamily: e.family, tier: e.tier, versionTag: "v1" },
+      update: { tier: e.tier },
+    });
+  }
+
+  // Division rules
+  const divisions = [
+    { family: "PwC", category: "STRATEGY", keywords: ["strategy"], multiplier: 1.0 },
+    { family: "PwC", category: "DEALS", keywords: ["deals", "m&a"], multiplier: 0.9 },
+    { family: "PwC", category: "AUDIT", keywords: ["audit"], multiplier: 0.4 },
+    { family: "Deloitte", category: "STRATEGY", keywords: ["monitor", "strategy", "consulting"], multiplier: 1.0 },
+    { family: "Deloitte", category: "AUDIT", keywords: ["audit"], multiplier: 0.4 },
+    { family: "EY", category: "STRATEGY", keywords: ["parthenon", "strategy"], multiplier: 1.0 },
+    { family: "EY", category: "AUDIT", keywords: ["audit"], multiplier: 0.4 },
+    { family: "KPMG", category: "DEALS", keywords: ["deal advisory"], multiplier: 0.9 },
+    { family: "KPMG", category: "AUDIT", keywords: ["audit"], multiplier: 0.4 },
+  ] as const;
+
+  for (const d of divisions) {
+    await prisma.divisionRoleTaxonomy.upsert({
+      where: {
+        country_employerFamily_category_versionTag: {
+          country: "UK",
+          employerFamily: d.family,
+          category: d.category,
+          versionTag: "v1",
+        },
+      },
+      create: {
+        country: "UK",
+        employerFamily: d.family,
+        category: d.category,
+        keywords: d.keywords,
+        selectivityMultiplier: d.multiplier,
+        versionTag: "v1",
+      },
+      update: {
+        keywords: d.keywords,
+        selectivityMultiplier: d.multiplier,
+      },
+    });
+  }
+}
