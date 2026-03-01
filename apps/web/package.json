@@ -13,7 +13,6 @@
     "@fairscreen/shared": "*",
     "@fairscreen/scoring": "*",
     "@fairscreen/extraction": "*",
-    "@fairscreen/worker": "*",
     "next": "^14.2.0",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",
@@ -34,8 +33,6 @@
     "@radix-ui/react-toggle-group": "^1.0.0",
     "@radix-ui/react-tooltip": "^1.0.0",
     "@radix-ui/react-progress": "^1.0.0",
-    "bullmq": "^5.7.0",
-    "ioredis": "^5.4.0",
     "bcryptjs": "^2.4.3",
     "zod": "^3.22.0"
   },

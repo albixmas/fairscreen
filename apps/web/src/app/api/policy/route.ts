@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db";
-import { assignZoneQueue } from "@/lib/queues";
 import {
   determineZone,
   meetsPercentileThresholds,
@@ -131,8 +130,57 @@ async function handleSave(body: any) {
     },
   });
 
-  // Trigger zone assignment
-  await assignZoneQueue.add("assign", { policyVersionId: policy.id });
+  // Run zone assignment inline
+  const candidates = await prisma.candidate.findMany({
+    include: {
+      axisScore: true,
+      preScreenResult: true,
+      subcategoryScores: true,
+    },
+    where: {
+      axisScore: { isNot: null },
+    },
+  });
+
+  await prisma.zoneAssignment.deleteMany({ where: { policyVersionId: policy.id } });
+
+  const assignments = [];
+  for (const c of candidates) {
+    if (!c.axisScore) continue;
+
+    const preScreenStatus = c.preScreenResult?.status ?? "FAIL";
+    const percentiles = new Map<string, number>();
+    for (const s of c.subcategoryScores) {
+      if (s.percentile != null) {
+        percentiles.set(s.code, s.percentile);
+      }
+    }
+
+    const zoneResult = determineZone(
+      c.axisScore.eduScore,
+      c.axisScore.careerScore,
+      (axisCutoffs || { strongYes: 18, yes: 15, maybe: 10 }) as AxisCutoffs,
+      preScreenStatus as "PASS" | "FAIL",
+      (spikePolicy || { enabled: true, thresholdPct: 0.99 }) as SpikePolicy,
+      percentiles
+    );
+
+    const meetsThresh = meetsPercentileThresholds(
+      percentiles,
+      subcategoryThresholds || {}
+    );
+
+    assignments.push({
+      candidateId: c.id,
+      zone: zoneResult.zone,
+      hiringZonePass: zoneResult.hiringZonePass && meetsThresh,
+      policyVersionId: policy.id,
+    });
+  }
+
+  if (assignments.length > 0) {
+    await prisma.zoneAssignment.createMany({ data: assignments });
+  }
 
   return NextResponse.json({ policy });
 }
