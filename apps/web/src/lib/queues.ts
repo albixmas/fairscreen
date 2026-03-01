@@ -1,14 +1,14 @@
-import { Queue } from "bullmq";
+import { Queue, type ConnectionOptions } from "bullmq";
 import IORedis from "ioredis";
 
 const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
 
 let connection: IORedis | null = null;
-function getConnection() {
+function getConnection(): ConnectionOptions {
   if (!connection) {
     connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
   }
-  return connection;
+  return connection as unknown as ConnectionOptions;
 }
 
 export const parseCvQueue = new Queue("parse_cv_file", { connection: getConnection() });
